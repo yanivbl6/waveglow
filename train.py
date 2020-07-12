@@ -37,6 +37,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from glow import WaveGlow, WaveGlowLoss
 from mel2samp import Mel2Samp
+from time import time
 
 def load_checkpoint(checkpoint_path, model, optimizer):
     assert os.path.isfile(checkpoint_path)
@@ -61,7 +62,8 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
 
 def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
           sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
-          checkpoint_path, with_tensorboard):
+          checkpoint_path, with_tensorboard, weight_sharing):
+    ws = weight_sharing
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     #=====START: ADDED FOR DISTRIBUTED======
@@ -107,15 +109,20 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
             os.chmod(output_directory, 0o775)
         print("output directory", output_directory)
 
+    name = "weightSharing%d" % ws
+    if num_gpus > 1:
+        name = name + "_x%d" % num_gpus
+
     if with_tensorboard and rank == 0:
         from tensorboardX import SummaryWriter
-        logger = SummaryWriter(os.path.join(output_directory, 'logs'))
+        logger = SummaryWriter(os.path.join("./logs", name))
 
     model.train()
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, epochs):
         print("Epoch: {}".format(epoch))
+        stime = time()
         for i, batch in enumerate(train_loader):
             model.zero_grad()
 
@@ -138,18 +145,22 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
 
             optimizer.step()
 
-            print("{}:\t{:.9f}".format(iteration, reduced_loss))
+            if (iteration % 100 == 0):
+                print("{}:\t{:.9f}".format(iteration, reduced_loss))
+
             if with_tensorboard and rank == 0:
                 logger.add_scalar('training_loss', reduced_loss, i + len(train_loader) * epoch)
 
             if (iteration % iters_per_checkpoint == 0):
                 if rank == 0:
-                    checkpoint_path = "{}/waveglow_{}".format(
-                        output_directory, iteration)
+                    checkpoint_path = "{}/waveglow_{}_{}".format(
+                        output_directory, name ,iteration)
                     save_checkpoint(model, optimizer, learning_rate, iteration,
                                     checkpoint_path)
 
             iteration += 1
+        tot_time = time() - stime
+        print("Epoch %d completed. Time: %d seconds" %(epoch, int(tot_time)))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -159,6 +170,10 @@ if __name__ == "__main__":
                         help='rank of process for distributed')
     parser.add_argument('-g', '--group_name', type=str, default='',
                         help='name of group for distributed')
+
+    parser.add_argument('-d', '--device', type=int, default=0,
+                        help='cuda device')
+
     args = parser.parse_args()
 
     # Parse configs.  Globals nicer in this case
@@ -182,6 +197,8 @@ if __name__ == "__main__":
 
     if num_gpus == 1 and args.rank != 0:
         raise Exception("Doing single GPU training on rank > 0")
+
+    torch.cuda.set_device(args.device)
 
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = False

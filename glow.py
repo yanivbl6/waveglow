@@ -59,26 +59,34 @@ class WaveGlowLoss(torch.nn.Module):
         return loss/(z.size(0)*z.size(1)*z.size(2))
 
 
+def genConv11(c):
+    conv = torch.nn.Conv1d(c, c, kernel_size=1, stride=1, padding=0,
+                                bias=False)
+
+    # Sample a random orthonormal matrix to initialize weights
+    W = torch.qr(torch.FloatTensor(c, c).normal_())[0]
+
+    # Ensure determinant is 1.0 not -1.0
+    if torch.det(W) < 0:
+        W[:,0] = -1*W[:,0]
+    W = W.view(c, c, 1)
+    conv.weight.data = W
+    return conv
+
+
 class Invertible1x1Conv(torch.nn.Module):
     """
     The layer outputs both the convolution, and the log determinant
     of its weight matrix.  If reverse=True it does convolution with
     inverse
     """
-    def __init__(self, c):
+    def __init__(self, c, conv = None):
         super(Invertible1x1Conv, self).__init__()
-        self.conv = torch.nn.Conv1d(c, c, kernel_size=1, stride=1, padding=0,
-                                    bias=False)
-
-        # Sample a random orthonormal matrix to initialize weights
-        W = torch.qr(torch.FloatTensor(c, c).normal_())[0]
-
-        # Ensure determinant is 1.0 not -1.0
-        if torch.det(W) < 0:
-            W[:,0] = -1*W[:,0]
-        W = W.view(c, c, 1)
-        self.conv.weight.data = W
-
+        if conv is None:
+            self.conv = genConv11(c)
+        else:
+            self.conv = conv
+            
     def forward(self, z, reverse=False):
         # shape
         batch_size, group_size, n_of_groups = z.size()
@@ -109,46 +117,54 @@ class WN(torch.nn.Module):
     size reset.  The dilation only doubles on each layer
     """
     def __init__(self, n_in_channels, n_mel_channels, n_layers, n_channels,
-                 kernel_size):
+                 kernel_size, prototype = None):
         super(WN, self).__init__()
         assert(kernel_size % 2 == 1)
         assert(n_channels % 2 == 0)
+
+
         self.n_layers = n_layers
         self.n_channels = n_channels
         self.in_layers = torch.nn.ModuleList()
         self.res_skip_layers = torch.nn.ModuleList()
 
-        start = torch.nn.Conv1d(n_in_channels, n_channels, 1)
-        start = torch.nn.utils.weight_norm(start, name='weight')
+
+        if prototype is None:
+            start = torch.nn.Conv1d(n_in_channels, n_channels, 1)
+            start = torch.nn.utils.weight_norm(start, name='weight')
+            end = torch.nn.Conv1d(n_channels, 2*n_in_channels, 1)
+            end.weight.data.zero_()
+            end.bias.data.zero_()
+
+            cond_layer = torch.nn.Conv1d(n_mel_channels, 2*n_channels*n_layers, 1)
+            self.cond_layer = torch.nn.utils.weight_norm(cond_layer, name='weight')
+
+            for i in range(n_layers):
+                dilation = 2 ** i
+                padding = int((kernel_size*dilation - dilation)/2)
+                in_layer = torch.nn.Conv1d(n_channels, 2*n_channels, kernel_size,
+                                           dilation=dilation, padding=padding)
+                in_layer = torch.nn.utils.weight_norm(in_layer, name='weight')
+                self.in_layers.append(in_layer)
+
+
+                # last one is not necessary
+                if i < n_layers - 1:
+                    res_skip_channels = 2*n_channels
+                else:
+                    res_skip_channels = n_channels
+                res_skip_layer = torch.nn.Conv1d(n_channels, res_skip_channels, 1)
+                res_skip_layer = torch.nn.utils.weight_norm(res_skip_layer, name='weight')
+                self.res_skip_layers.append(res_skip_layer)
+
+        else:
+            start = prototype.start
+            end = prototype.end
+            self.cond_layer = prototype.cond_layer
+            self.in_layers = prototype.in_layers
+            self.res_skip_layers = prototype.res_skip_layers
         self.start = start
-
-        # Initializing last layer to 0 makes the affine coupling layers
-        # do nothing at first.  This helps with training stability
-        end = torch.nn.Conv1d(n_channels, 2*n_in_channels, 1)
-        end.weight.data.zero_()
-        end.bias.data.zero_()
         self.end = end
-
-        cond_layer = torch.nn.Conv1d(n_mel_channels, 2*n_channels*n_layers, 1)
-        self.cond_layer = torch.nn.utils.weight_norm(cond_layer, name='weight')
-
-        for i in range(n_layers):
-            dilation = 2 ** i
-            padding = int((kernel_size*dilation - dilation)/2)
-            in_layer = torch.nn.Conv1d(n_channels, 2*n_channels, kernel_size,
-                                       dilation=dilation, padding=padding)
-            in_layer = torch.nn.utils.weight_norm(in_layer, name='weight')
-            self.in_layers.append(in_layer)
-
-
-            # last one is not necessary
-            if i < n_layers - 1:
-                res_skip_channels = 2*n_channels
-            else:
-                res_skip_channels = n_channels
-            res_skip_layer = torch.nn.Conv1d(n_channels, res_skip_channels, 1)
-            res_skip_layer = torch.nn.utils.weight_norm(res_skip_layer, name='weight')
-            self.res_skip_layers.append(res_skip_layer)
 
     def forward(self, forward_input):
         audio, spect = forward_input
@@ -176,10 +192,10 @@ class WN(torch.nn.Module):
 
 
 class WaveGlow(torch.nn.Module):
-    def __init__(self, n_mel_channels, n_flows, n_group, n_early_every,
-                 n_early_size, WN_config):
+    def __init__(self, n_mel_channels, n_flows , n_group, n_early_every,
+                 n_early_size, weight_sharing, WN_config):
         super(WaveGlow, self).__init__()
-
+        ws = weight_sharing
         self.upsample = torch.nn.ConvTranspose1d(n_mel_channels,
                                                  n_mel_channels,
                                                  1024, stride=256)
@@ -196,12 +212,35 @@ class WaveGlow(torch.nn.Module):
         # Set up layers with the right sizes based on how many dimensions
         # have been output already
         n_remaining_channels = n_group
+
+        convDict = {}
+        wnDict = {}
+
+        msg = ["Vanilla","conv1x1 wieght sharing","WN weight sharing", "Conv1x1 and WN weight sharing"]
+        print("Mode: %s" % msg[ws])
+        
         for k in range(n_flows):
             if k % self.n_early_every == 0 and k > 0:
                 n_half = n_half - int(self.n_early_size/2)
                 n_remaining_channels = n_remaining_channels - self.n_early_size
-            self.convinv.append(Invertible1x1Conv(n_remaining_channels))
-            self.WN.append(WN(n_half, n_mel_channels*n_group, **WN_config))
+
+            if ws % 2 == 1:
+                if not n_remaining_channels in convDict:
+                    convDict[n_remaining_channels] = genConv11(n_remaining_channels)
+                self.convinv.append(Invertible1x1Conv(n_remaining_channels,convDict[n_remaining_channels]))
+            else:
+                self.convinv.append(Invertible1x1Conv(n_remaining_channels))
+            
+
+            if ws < 2:
+                self.WN.append(WN(n_half, n_mel_channels*n_group, **WN_config))
+            else:
+                pair = (n_half, n_mel_channels*n_group)
+                if not pair in wnDict:
+                    wnDict[pair] = WN(n_half, n_mel_channels*n_group, **WN_config)
+
+                self.WN.append(wnDict[pair])
+
         self.n_remaining_channels = n_remaining_channels  # Useful during inference
 
     def forward(self, forward_input):
@@ -295,7 +334,11 @@ class WaveGlow(torch.nn.Module):
     @staticmethod
     def remove_weightnorm(model):
         waveglow = model
+        handled = []
         for WN in waveglow.WN:
+            if WN in handled: ## for the case of weight sharing
+                continue
+            handled.append(WN) 
             WN.start = torch.nn.utils.remove_weight_norm(WN.start)
             WN.in_layers = remove(WN.in_layers)
             WN.cond_layer = torch.nn.utils.remove_weight_norm(WN.cond_layer)
