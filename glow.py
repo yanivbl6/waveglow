@@ -64,7 +64,7 @@ def genConv11(c):
                                 bias=False)
 
     # Sample a random orthonormal matrix to initialize weights
-    W = torch.qr(torch.FloatTensor(c, c).normal_())[0]
+    W = torch.qr(torch.FloatTensor(c, c).normal_())[0].contiguous()
 
     # Ensure determinant is 1.0 not -1.0
     if torch.det(W) < 0:

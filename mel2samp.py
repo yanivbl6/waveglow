@@ -61,13 +61,7 @@ def load_wav_to_torch(full_path):
 # forward_input[0] = mel_spectrogram:  batch x n_mel_channels x frames
 # forward_input[1] = audio: batch x time
 
-class audioTask():
-    def __init__(self, idx, start, end):
-        self.idx = idx
-        self.start = start
-        self.end = end
-
-class Mel2Samp(torch.utils.data.Dataset):
+class Mel2SampSplit(torch.utils.data.Dataset):
     """
     This is the main class that calculates the spectrogram and returns the
     spectrogram, audio pair.
@@ -83,7 +77,98 @@ class Mel2Samp(torch.utils.data.Dataset):
                                  mel_fmin=mel_fmin, mel_fmax=mel_fmax)
         self.segment_length = segment_length
         self.sampling_rate = sampling_rate
-        self.timings = self.get_timings()
+        self.dataset = self.pack()
+
+
+
+
+
+    def pack(self):
+        timings = np.zeros(len(self.audio_files), dtype= np.int32)
+        PAD = 350
+        assert(self.sampling_rate % PAD == 0)
+
+        for i,file in enumerate(self.audio_files):
+            audio, sampling_rate = load_wav_to_torch(file)
+            if sampling_rate != self.sampling_rate:
+                raise ValueError("{} SR doesn't match target {} SR".format(
+                    sampling_rate, self.sampling_rate))
+            t = audio.size(0)
+            t2 = t + t % PAD
+            
+            timings[i] = t2
+
+        segment_len = self.sampling_rate
+
+        total_time = timings.sum() 
+        n_data = int(total_time // segment_len) if total_time % segment_len  == 0 else int((total_time // segment_len) + 1)
+        
+        ##import pdb; pdb.set_trace()
+        
+        dataset = torch.zeros([ n_data,segment_len], dtype=torch.float32 ) ## all data will be here
+        offset = 0
+        cur = 0
+        for i,file in enumerate(self.audio_files):
+            audio, _ = load_wav_to_torch(file)
+            audio = torch.nn.functional.pad(audio, (0, timings[i] - audio.size(0)), 'constant').data
+            assert(timings[i]  == audio.size(0))
+            data_left =  audio.size(0)
+            data_offset = 0
+            space = segment_len - offset
+            while (data_left >= space): ## fill the next data segment to the end
+                dataset.data[cur,offset:offset+space] = audio[data_offset:data_offset+space]
+                data_left = data_left - space
+                data_offset = data_offset + space
+                offset = 0
+                space = segment_len
+                cur = cur + 1
+
+            ## append whats left in the next data segement
+            if data_left > 0:
+                new_offset = offset + data_left
+                dataset.data[cur,offset:new_offset] = audio[data_offset:]
+                offset = new_offset
+                
+        return dataset
+
+    def get_mel(self, audio):
+        audio_norm = audio / MAX_WAV_VALUE
+        audio_norm = audio_norm.unsqueeze(0)
+        audio_norm = torch.autograd.Variable(audio_norm, requires_grad=False)
+        melspec = self.stft.mel_spectrogram(audio_norm)
+        melspec = torch.squeeze(melspec, 0)
+        return melspec
+
+    def __getitem__(self, index):
+        # Read audio
+        audio = self.dataset.data[index,:]
+        mel = self.get_mel(audio)
+        audio = audio / MAX_WAV_VALUE
+        return (mel, audio)
+
+    def __len__(self):
+        return self.dataset.size(0)
+
+
+class Mel2Samp2(torch.utils.data.Dataset):
+    """
+    This is the main class that calculates the spectrogram and returns the
+    spectrogram, audio pair.
+    """
+    def __init__(self, training_files, segment_length, filter_length,
+                 hop_length, win_length, sampling_rate, mel_fmin, mel_fmax):
+        self.audio_files = files_to_list(training_files)
+        random.seed(1234)
+        random.shuffle(self.audio_files)
+
+        self.stft = TacotronSTFT(filter_length=filter_length,
+                                 hop_length=hop_length,
+                                 win_length=win_length,
+                                 sampling_rate=sampling_rate,
+                                 mel_fmin=mel_fmin, mel_fmax=mel_fmax)
+        self.segment_length = segment_length
+        self.sampling_rate = sampling_rate
+        self.everything = self.pack()
 
 
         self.max_time = self.segment_length
@@ -110,21 +195,24 @@ class Mel2Samp(torch.utils.data.Dataset):
         self.balancer = [self.balancer[p] for p in perm  ]
 
         
-    def do_binpacking(self):
-        bins = binpacking.to_constant_volume({ i: t  for  i, t in enumerate(self.timings)},self.max_time)
-        ##efficiency = [int(np.asarray(list(b.values())).sum()/self.max_time*100) for b in bins]
-        self.volumes = [np.asarray(list(b.values())).sum() for b in bins ]
-        self.balancer =[b.keys() for b in bins]
-
-    def get_timings(self):
-        timings = []
+    def pack(self):
         for file in self.audio_files:
             audio, sampling_rate = load_wav_to_torch(file)
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} SR doesn't match target {} SR".format(
                     sampling_rate, self.sampling_rate))
             timings.append(audio.size(0))
-        return timings
+
+
+
+    def get_timings(self):
+        timings = np.zeros(len(self.audio_files))
+        for file in self.audio_files:
+            audio, sampling_rate = load_wav_to_torch(file)
+            if sampling_rate != self.sampling_rate:
+                raise ValueError("{} SR doesn't match target {} SR".format(
+                    sampling_rate, self.sampling_rate))
+            timings.append(audio.size(0))
 
     def get_mel(self, audio):
         audio_norm = audio / MAX_WAV_VALUE
@@ -179,7 +267,7 @@ class Mel2Samp(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.balancer)
 
-class Mel2Samp2(torch.utils.data.Dataset):
+class Mel2Samp(torch.utils.data.Dataset):
     """
     This is the main class that calculates the spectrogram and returns the
     spectrogram, audio pair.

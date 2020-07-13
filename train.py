@@ -36,7 +36,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torch.utils.data import DataLoader
 from glow import WaveGlow, WaveGlowLoss
-from mel2samp import Mel2Samp
+from mel2samp import Mel2Samp, Mel2SampSplit
 from time import time
 
 def load_checkpoint(checkpoint_path, model, optimizer):
@@ -62,7 +62,8 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
 
 def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
           sigma, iters_per_checkpoint, batch_size, seed, fp16_run,
-          checkpoint_path, with_tensorboard, weight_sharing):
+          checkpoint_path, with_tensorboard, weight_sharing, optimizer_type, dataloader_type):
+          
     ws = weight_sharing
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -79,7 +80,15 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
         model = apply_gradient_allreduce(model)
     #=====END:   ADDED FOR DISTRIBUTED======
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer_type = optimizer_type.lower()
+    if optimizer_type== "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    elif optimizer_type == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    else:
+        print("Unsupported optimizer: %s. Aborting." % optimizer_type)
+        return None
+
 
     if fp16_run:
         from apex import amp
@@ -92,11 +101,19 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
                                                       optimizer)
         iteration += 1  # next iteration is iteration + 1
 
-    trainset = Mel2Samp(**data_config)
+    dataloader_type  =dataloader_type.lower()
+    if dataloader_type == "vanilla":
+        trainset = Mel2Samp(**data_config)
+    elif dataloader_type == "split":
+        trainset = Mel2SampSplit(**data_config)
+    else:
+        print("Unsupported dataloader type: %s. Aborting." % dataloader_type)
+        return None
+
     # =====START: ADDED FOR DISTRIBUTED======
     train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
     # =====END:   ADDED FOR DISTRIBUTED======
-    train_loader = DataLoader(trainset, num_workers=1, shuffle=False,
+    train_loader = DataLoader(trainset, num_workers=1, shuffle=(num_gpus == 1),
                               sampler=train_sampler,
                               batch_size=batch_size,
                               pin_memory=False,
@@ -109,7 +126,11 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
             os.chmod(output_directory, 0o775)
         print("output directory", output_directory)
 
-    name = "weightSharing%d" % ws
+    name = "waveglow_ws%d_%s_%s_batch%d" % (ws,optimizer_type,dataloader_type,batch_size)
+
+    if learning_rate != 1e-4:
+        name = name + "_lr{:.0e}".format(learning_rate) 
+
     if num_gpus > 1:
         name = name + "_x%d" % num_gpus
 
@@ -120,6 +141,7 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
     model.train()
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
+    stime2 = None
     for epoch in range(epoch_offset, epochs):
         print("Epoch: {}".format(epoch))
         stime = time()
@@ -146,8 +168,10 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
             optimizer.step()
 
             if (iteration % 100 == 0):
-                print("{}:\t{:.9f}".format(iteration, reduced_loss))
-
+                if not stime2 is None:
+                    tot_time2 = time() - stime2
+                    print("{}:\t{:.9f}, time: {}".format(iteration, reduced_loss,int(tot_time2)))
+                stime2 = time()
             if with_tensorboard and rank == 0:
                 logger.add_scalar('training_loss', reduced_loss, i + len(train_loader) * epoch)
 
@@ -198,7 +222,7 @@ if __name__ == "__main__":
     if num_gpus == 1 and args.rank != 0:
         raise Exception("Doing single GPU training on rank > 0")
 
-    torch.cuda.set_device(args.device)
+    ##torch.cuda.set_device(args.device)
 
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = False
